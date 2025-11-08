@@ -1,0 +1,10 @@
+python-dotenv
+pandas
+numpy
+yfinance
+pyportfolioopt
+openai
+langchain
+faiss-cpu
+scipy
+matplotlib
