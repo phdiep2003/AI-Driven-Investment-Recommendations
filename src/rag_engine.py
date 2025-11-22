@@ -200,7 +200,7 @@ def _get_embeddings():
             "or set RAG_USE_STUB_EMBEDDINGS=1 for a stub."
         )
     # Model name can be overridden via env: OPENAI_EMBEDDING_MODEL
-    model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+    model = os.getenv("OPENAI_EMBEDDING_MODEL", "gpt-4.1-mini")
     # OPENAI_API_KEY should be present in environment
     return OpenAIEmbeddings(model=model)
 
