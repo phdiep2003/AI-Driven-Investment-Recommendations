@@ -5,6 +5,7 @@
 import os
 import json
 from datetime import datetime, timedelta
+from rag_memory import rag_add_example, rag_retrieve_similar_for_agent1
 from typing import List, Dict, Tuple
 import time
 import numpy as np
@@ -15,6 +16,31 @@ from pydantic import BaseModel
 from scipy.optimize import minimize
 from openai import OpenAI
 import plotly.express as px
+
+
+# =====================================================================
+#  TOOL DEFINITIONS FOR AGENT 1
+# =====================================================================
+agent1_tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "quant_engine",
+            "description": "Runs the portfolio optimizer on a list of selected stock tickers (15-20 total).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tickers": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "The final list of 15-20 selected stock tickers (e.g., ['AAPL', 'MSFT', 'JPM'])."
+                    }
+                },
+                "required": ["tickers"]
+            },
+        },
+    },
+]
 
 # ============================================================================
 #  STREAMLIT CONFIG + DARK CHATGPT-STYLE UI
@@ -59,7 +85,7 @@ input {
 /* Section headers */
 .section-header {
     color: #10a37f;
-    font-size: 1.4rem;
+    font-size: 1.6rem;
     font-weight: 700;
     margin-top: 1.3rem;
     margin-bottom: 0.6rem;
@@ -131,8 +157,6 @@ div.stSlider>div>div>div>input {
 # ============================================================================
 #  MODELS
 # ============================================================================
-
-
 class CustomerProfile(BaseModel):
     # Client details
     full_name: str
@@ -182,11 +206,6 @@ class CustomerProfile(BaseModel):
     islamic_investing: bool  # derived from Shariah-related flags
 
 
-class Agent1Output(BaseModel):
-    selected_stock_tickers: List[str]
-    reasoning: str
-
-
 class QuantEngineOutput(BaseModel):
     portfolio_weights: Dict[str, float]
     expected_annual_return: float
@@ -194,13 +213,61 @@ class QuantEngineOutput(BaseModel):
     optimization_details: str
 
 
-class Agent2Output(BaseModel):
+class Agent1Output(BaseModel):
+    selected_stock_tickers: List[str]
+    reasoning: str
+    quant_output: QuantEngineOutput | None = None
+
+
+class Agent2EvaluatedPortfolio(BaseModel):
+    """
+    Output of Agent 2 (Portfolio Manager): a structured evaluation of the
+    portfolio that Agent 3 will consume when writing the narrative report.
+    """
+    overall_score: float  # 0–100
+    risk_score: float  # 0–100, higher = more risk
+    diversification_score: float  # 0–100
+    liquidity_score: float  # 0–100
+    
+
+    suitability_bucket: str  # e.g. "Conservative", "Balanced", "Aggressive", "Unsuitable"
+
+    risk_exposure_summary: str
+    diversification_summary: str
+    liquidity_and_horizon_summary: str
+    approval: str
+
+    concentration_flags: List[str]
+    mistakes: List[str]
+
+
+class Agent3Output(BaseModel):
+    """
+    Output of Agent 3 (Report Writer). This keeps the same fields
+    as the original Agent 2 output to avoid changing downstream UI.
+    """
     suitability_explanation: str
     ethical_considerations: str
     shariah_compliance_statement: str
     risk_assessment: str
     limitations: str
 
+# =====================================================================
+#  TOOL WRAPPERS (Agent 1 is allowed to call only these)
+# =====================================================================
+
+def tool_python_pre_filter_stocks(profile, df):
+    prof = CustomerProfile(**profile)
+    df_pd = pd.DataFrame(df)
+    return python_pre_filter_stocks(prof, df_pd)
+
+def tool_download_prices(tickers):
+    out = download_prices(tickers)
+    return out.to_dict()  # must return JSON-serializable
+
+def tool_quant_engine(tickers):
+    q = quant_engine(tickers)
+    return q.model_dump()
 
 # ============================================================================
 # 1 — FAST S&P 500 LOADER
@@ -313,115 +380,224 @@ def load_sp500_list() -> pd.DataFrame:
 # 2 — Python Pre-filter (Agent 1 helper)
 # ============================================================================
 
-
 def python_pre_filter_stocks(profile: CustomerProfile, df: pd.DataFrame):
     """
-    Optimized:
-    - Fast dataframe ops
-    - Reduced columns
-    - Return only TOP 25 candidates for speed
+    Educational example:
+    - Filters items based on user profile rules.
+    - Scores items using normalized quality metrics.
+    - Returns the top 70 based on composite score.
     """
-    data = df.copy()
+    filtered_df = df.copy()
 
+    # 1. Apply initial filter based on islamic_investing flag
     if profile.islamic_investing:
-        data = data[data["shariah_compliant"] == True]
+        filtered_df = filtered_df[filtered_df['shariah_compliant'] == True]
 
-    required = ["roe", "revenue_growth", "beta"]
-    data = data.dropna(subset=required)
+    # 2. Remove stocks with missing 'Expected Return' or 'Volatility' values
+    filtered_df = filtered_df.dropna(subset=['Expected Return', 'Volatility'])
 
-    if profile.risk_tolerance == "low":
-        data = data[data["beta"] < 1]
-        data = data[data["roe"] > 0.05]
-    elif profile.risk_tolerance == "medium":
-        data = data[data["beta"] < 1.3]
-        data = data[data["roe"] > 0.08]
-    elif profile.risk_tolerance == "high":
-        data = data[data["roe"] > 0.12]
-        data = data[data["revenue_growth"] > 0]
+    # 3. Apply ranking heuristic
+    if profile.risk_tolerance == 'low' or profile.primary_goal == 'Capital preservation':
+        # Prioritize lower Volatility, then higher Expected Return
+        ranked_df = filtered_df.sort_values(by=['Volatility', 'Expected Return'], ascending=[True, False])
+    elif profile.risk_tolerance == 'high' or profile.primary_goal == 'Long-term growth':
+        ranked_df = filtered_df.sort_values(by=['Expected Return', 'Volatility'], ascending=[False, True])
+    else: # medium risk or income goal
+        ranked_df = filtered_df.copy()
+        ranked_df['Sharpe_Ratio_Proxy'] = ranked_df['Expected Return'] / (ranked_df['Volatility'] + 1e-9)
+        ranked_df = ranked_df.sort_values(by='Sharpe_Ratio_Proxy', ascending=False)
 
-    def score(row):
-        return (
-            row["roe"] * 0.35
-            + row["revenue_growth"] * 0.25
-            + (1 / (1 + abs(row["beta"]))) * 0.15
-        )
-
-    data["quality_score"] = data.apply(score, axis=1)
-    top = data.sort_values("quality_score", ascending=False).head(25)
-
-    return top.to_dict(orient="records")
-
+    return ranked_df.to_dict(orient="records")
 
 # ============================================================================
 # 3 — Agent 1 (GPT) — stock selection
 # ============================================================================
-
-
 def agent1_gpt4o(profile: CustomerProfile, sp500: pd.DataFrame) -> Agent1Output:
+    # 1) Pre-filter candidates in Python (unchanged logic)
     candidates = python_pre_filter_stocks(profile, sp500)
     candidates_json = json.dumps(candidates, indent=2)
     profile_json = profile.model_dump_json(indent=2)
 
-    # Conditional text: include Shariah clause ONLY if Islamic investing is True
+    # 2) Retrieve similar past cases from RAG to help avoid repeated mistakes
+    try:
+        similar_cases = rag_retrieve_similar_for_agent1(profile)
+    except Exception:
+        similar_cases = []
+    similar_text = json.dumps(similar_cases, indent=2) if similar_cases else "[]"
+    print(similar_text)
+    # 3) Shariah clause (unchanged)
     shariah_clause = (
         "- Respect Shariah / Islamic requirements if indicated.\n"
         if profile.islamic_investing
         else ""
     )
 
-    prompt = f"""
-You are Agent 1, an equity portfolio construction assistant for institutional investors.
+    # ----------------------------------------------------------------------
+    # USER PROMPT (goes into a user message, NOT system)
+    # ----------------------------------------------------------------------
+    user_prompt = f"""
+You are **Agent 1, an equity portfolio construction assistant** for institutional investors. You are expected to act as a knowledgeable professional who synthesizes all available data, including case history, to propose a compliant and suitable portfolio.
 
 You are given:
 1) A filtered set of S&P 500 stocks with basic quality metrics.
 2) A full institutional investor questionnaire response in JSON.
+3) A small set of past, similar client cases (from internal memory - RAG).
 
 Your task:
 - Select **15–20 tickers** from the candidates.
-- Make sure the selections reflect ALL aspects of the profile:
-  • Full name / email only for labeling (no doxxing).
-  • Return objectives (target return, risk/return trade-off, tolerance for underperformance).
-  • Liquidity & time horizon.
-  • Legal & regulatory constraints (ERISA, UCITS, jurisdiction limits). 
+- Ensure the selections reflect **ALL** aspects of the client profile, including:
+  • Return objectives, risk tolerance, and underperformance tolerance.
+  • Liquidity and time horizon.
+  • Legal & regulatory constraints (ERISA, UCITS, jurisdiction limits).
   {shariah_clause.strip()}
-  • Tax status and tax preferences (capital-gains vs income, deferral preference).
+  • Tax status and tax preferences.
   • ESG / ethical exclusions and flags.
   • Diversification and concentration tolerance (max issuer/sector).
   • Asset allocation preferences and management style.
   • Preferred benchmark and reporting cadence.
-  • Any other information contained in the JSON profile.
+
+---
+
+### 🚨 RAG MEMORY: AVOID PAST MISTAKES 🚨
+**CRITICAL:** Review the JSON object below, which contains past case failures (`mistakes`) for clients with similar profiles.
+**Your portfolio must be explicitly designed to avoid the specific mistakes listed,** especially sector concentration breaches.
+
+{similar_text}
+
+### HARD CONSTRAINTS (MUST FOLLOW):
+1. **SECTOR CONCENTRATION CHECK:** You **MUST** reference the client's `concentration_tolerance` from the profile JSON. Your selection must ensure the largest single sector weight (by GICS classification) **does not exceed that limit.**
+2. **DISTRIBUTION:** Aim for a smooth, well-diversified sector mix, targeting representation in at least **5 different GICS sectors** where possible. Avoid clustering all 15-20 stocks into the minimum 3 sectors.
+3. If the client's risk tolerance is "low":
+   - Favour defensive sectors (e.g., Consumer Staples, Utilities, high-quality diversified names).
+   - Be especially careful with cyclical or highly volatile sectors (e.g., Energy, Materials, Information Technology depending on market context).
+4. Respect all stated ESG and ethical constraints at ticker/industry level.
 
 Important:
 - Respect explicit exclusions (industries, structures, jurisdictions).
 - Avoid concentration that conflicts with the stated tolerance.
 {shariah_clause}
 
-Input — Filtered candidates (list of dicts):
+---
+
+### Input — Filtered candidates (list of dicts):
 {candidates_json}
 
-Input — Customer profile JSON:
+### Input — Customer profile JSON:
 {profile_json}
 
 You must respond with **ONLY** a JSON object with this exact schema:
 
 {{
   "selected_stock_tickers": ["TICKER1", "TICKER2", "..."],
-  "reasoning": "A detailed but concise explanation (CFA-level) describing why these stocks fit the profile."
+  "reasoning": "A detailed but concise explanation (CFA-level) describing why these stocks fit the profile, **how you ensured compliance with the profile's sector concentration limit**, which **GICS sectors** are represented, and how lessons from RAG memory were applied.",
+  "quant_output": "Returned automatically from calling quant_engine"
 }}
 """
 
     client = OpenAI()
 
-    res = client.chat.completions.create(
-        model="gpt-4o-mini",
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": "Return ONLY JSON following the schema."},
-        ],
-    )
+    # ----------------------------------------------------------------------
+    # Tool-using loop
+    # ----------------------------------------------------------------------
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are Agent 1, an institutional equity portfolio construction "
+                "assistant. You MUST follow the user's instructions exactly and "
+                "return strictly valid JSON when giving a final answer."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                user_prompt
+                + "\n\nReturn ONLY JSON following the schema above. "
+                  "After selecting tickers, you MUST call quant_engine(tickers) "
+                  "via a tool call and include its returned JSON under the field "
+                  "'quant_output'."
+            ),
+        },
+    ]
+    while True:
+        res = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            tools=agent1_tools,
+            tool_choice="auto",
+        )
 
-    return Agent1Output.model_validate_json(res.choices[0].message.content)
+        msg = res.choices[0].message
+
+        # Record assistant/tool messages into the conversation
+        messages.append(
+            {
+                "role": msg.role,
+                "content": msg.content,
+                "tool_calls": msg.tool_calls,
+            }
+        )
+
+        # --------------------------------------------------
+        # If the model produced final JSON (no more tool calls)
+        # --------------------------------------------------
+        if msg.content and not msg.tool_calls:
+            try:
+                raw = json.loads(msg.content)
+            except json.JSONDecodeError:
+                # If the model returned invalid JSON, ask it once more to fix it
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "The previous response was not valid JSON. "
+                            "Please resend ONLY a valid JSON object that matches "
+                            "the required schema."
+                        ),
+                    }
+                )
+                continue
+
+            # Detect quant_engine tool output
+            quant_result = None
+            for m in messages:
+                if m.get("role") == "tool":
+                    try:
+                        content = json.loads(m.get("content", ""))
+                        if "portfolio_weights" in content:
+                            quant_result = QuantEngineOutput(**content)
+                    except Exception:
+                        pass
+            return Agent1Output(
+                selected_stock_tickers=raw.get("selected_stock_tickers", []),
+                reasoning=raw.get("reasoning", ""),
+                quant_output=quant_result,
+            )
+
+        # --------------------------------------------------
+        # A tool was called
+        # --------------------------------------------------
+        for tc in msg.tool_calls or []:
+            name = tc.function.name
+            args = json.loads(tc.function.arguments)
+            # --- UI FEEDBACK ---
+            if name == "python_pre_filter_stocks":
+                tool_result = tool_python_pre_filter_stocks(**args)
+            elif name == "download_prices":
+                tool_result = tool_download_prices(**args)
+            elif name == "quant_engine":
+                tool_result = tool_quant_engine(**args)
+            else:
+                tool_result = {"error": "unknown tool"}
+
+            # Append tool result message
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": json.dumps(tool_result),
+                }
+            )
 
 
 # ============================================================================
@@ -517,22 +693,178 @@ def quant_engine(tickers: List[str]) -> QuantEngineOutput:
         optimization_details="Optimized with 5-year monthly historical data (8-week cached).",
     )
 
-
 # ============================================================================
-# 6 — Agent 2 (GPT) — narrative report
+# 6 — Agent 2 (GPT) — Portfolio Manager (portfolio evaluation)
 # ============================================================================
-
-def agent2_gpt(
+def agent2_portfolio_manager_gpt(
     profile: CustomerProfile,
     a1: Agent1Output,
     qout: QuantEngineOutput,
-    cfa_ethical_guidelines_str: str
-) -> Agent2Output:
+) -> Agent2EvaluatedPortfolio:
+    """
+    Agent 2: Acts as a Senior Investment Committee Member. Takes Agent 1's
+    proposed portfolio + quant metrics and produces a structured evaluation
+    focused on risk-adjusted suitability, fiduciary compliance, and materiality.
+    """
     client = OpenAI()
+
+    # ---------------------------------------------------------
+    # JSON schema remains the same
+    # ---------------------------------------------------------
+    json_schema = r"""{
+  "overall_score": 0.0,
+  "risk_score": 0.0,
+  "diversification_score": 0.0,
+  "liquidity_score": 0.0,
+  "approval": "approved" | "not approved",
+  "suitability_bucket": "Conservative or Balanced or Aggressive or Unsuitable",
+  "risk_exposure_summary": "text explanation for a professional non-quant client",
+  "diversification_summary": "text explanation",
+  "liquidity_and_horizon_summary": "text explanation",
+  "concentration_flags": ["text", "..."],
+  "mistakes": ["machine-readable portfolio issues"]
+}"""
+
+    # ---------------------------------------------------------
+    # Revised Prompt: Rigorous, Fiduciary-Focused, and Sensible (Sector Strictness Added)
+    # ---------------------------------------------------------
+    user_prompt = f"""
+You are **Agent 2, a Senior Member of the Investment Committee** at a leading institutional asset manager. Your primary mandate is **fiduciary duty and evidence-based risk management.** You must conduct a rigorous, professional assessment of the proposed portfolio's **material alignment** with the client's profile, prioritizing **consistency, low volatility, and capital preservation** for conservative clients.
+
+You receive:
+A full institutional client profile (JSON)
+Agent 1’s proposed stock selections and reasoning
+Portfolio weights and risk statistics from a quant engine
+
+Your job is to evaluate the proposed portfolio and produce a structured "evaluated portfolio" JSON object. **Your assessment must be critical, but commercially sensible, based on the materiality of risk deviations.**
+
+---
+
+### **Evaluation Criteria: Focus on Material Risk and Fiduciary Compliance**
+
+**Risk (0–100) - Consistency and Materiality**
+Your risk score must reflect the **materiality** of risk relative to the client’s stated tolerance and the need for capital preservation.
+* Assess total portfolio risk (volatility, concentration, tail risk, factor exposures) against the **maximum acceptable risk limits** for the client's profile.
+* **CRITICAL CONCENTRATION WARNING:** **Any sector weighting exceeding the client's stated concentration tolerance OR exceeding 30% (if no client limit is stated) must be treated as a severe and material breach, resulting in an immediate penalty.**
+* **NEW TOLERANCE ADDITION:** A **2% de minimis tolerance** applies to the concentration limit (i.e., a 30.5% concentration should be a *moderate* issue, not an immediate severe breach, but 32% remains a structural failure). Minor, justifiable deviations should only result in moderate score reductions.
+* **Reserve very low scores (below 30)** only for portfolios exhibiting **structural non-compliance** with the client's core risk tolerance (e.g., Annual Volatility significantly exceeding the low-risk target).
+
+**Diversification (0–100) - Risk Mitigation Assessment (Heightened Sector Scrutiny)**
+* Evaluate diversification as a key **risk mitigation factor.**
+* **HIGH PENALTY ZONE:** **Over-exposure to a single sector is the primary focus of this score.** Penalize clustered risks (issuer, sector, geography, factor) based on their **potential to cause a material loss** to the client. The sector concentration must heavily weigh on this score.
+* A well-diversified portfolio should score highly; **non-compliance with internal diversification policies** should be clearly flagged.
+
+**Liquidity & Horizon (0–100) - Access and Time Alignment**
+* Assess the practical alignment of the portfolio's liquidity with the client's stated needs and investment horizon.
+* **Illiquid assets** are acceptable for long-horizon clients if justified, but **must be penalized** if they violate the client's liquidity requirements. Score reduction should be proportional to the liquidity mismatch size.
+
+**Approval (Fiduciary & Action Alignment)**
+Return exactly one of: approved, not approved.
+
+* "**approved**": This status now covers both full approval and approval with *actionable caveats*. It must be used when the portfolio meets **material financial suitability** (Overall Score > 75 recommended) AND does not violate any **explicit, documented client prohibitions.**
+    * **Crucial Rule:** If approval is granted, but a **material issue exists that requires remediation or follow-up**, you *must* list that issue in the `mistakes` field (e.g., `Sector concentration exceeds soft limit, must be reduced within 5 days`). The **`mistakes` field is now the designated location for documenting required conditions.**
+* "**not approved**" is reserved only for **irrefutable, documented conflicts** with explicit client prohibitions, regulatory non-compliance, or a **fundamental breakdown of suitability** (Overall Score < 50, or Suitability Bucket = "Unsuitable").
+
+**Overall Suitability (0–100) - Fiduciary Alignment**
+Integrate all prior dimensions. Suitability is the final measure of **fiduciary compliance and appropriateness.**
+* REVISED SCORING: A major sector concentration breach will **significantly** reduce this score (e.g., to the 50-70 range), but the final score must reflect the **balance of all factors.** A portfolio with a concentration breach but otherwise perfect risk/liquidity alignment should score **higher than 60.**
+* Assign exactly one suitability bucket: Conservative, Balanced, Aggressive, Unsuitable.
+* **“Unsuitable”** is reserved for portfolios that demonstrate a **fundamental breakdown of suitability** (e.g., an Aggressive portfolio for a Conservative client).
+
+**Concentration & Exposure Flags**
+List **all exposures, concentrations, or risks** that warrant attention from the Investment Committee. Focus on **material risks** and **technical policy breaches,** especially **sector overweights.**
+
+**Mistakes (The Actionable Issue Log - NOW INCLUDES CONDITIONS)**
+You must list **all material compliance issues, policy breaches, or structural mistakes** in the "mistakes" field as short, machine-readable items such as:
+`Sector concentration exceeds 30% soft limit, reduce by 2% immediately`, `Portfolio risk exceeds low-risk mandate boundary, requires rebalancing`, `Exposure violates explicit client prohibition`.
+If there are no material mistakes or breaches, return `[]`.
+---
+
+Inputs:
+
+Customer Profile (JSON):
+{profile.model_dump_json(indent=2)}
+
+Agent 1 Selected Tickers:
+{a1.selected_stock_tickers}
+
+Quant Engine Output:
+Portfolio weights: {qout.portfolio_weights}
+Expected annual return: {qout.expected_annual_return:.4f}
+Annual volatility: {qout.annual_volatility:.4f}
+Optimization details: {qout.optimization_details}
+
+Output Format (Mandatory)
+Respond only with a JSON object that exactly matches:
+
+{json_schema}
+
+Use 0–100 numeric scales.
+Do not include any fields beyond those listed.
+The output must be valid JSON.
+"""
+
+    # ---------------------------------------------------------
+    # LLM Call (unchanged)
+    # ---------------------------------------------------------
+    res = client.chat.completions.create(
+        model="gpt-4o-mini",
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a professional institutional Investment Committee Member. "
+                    "Be rigorous, evidence-based, focused on materiality and fiduciary duty, and return strictly valid JSON."
+                ),
+            },
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+
+    # ---------------------------------------------------------
+    # Parse into your dataclass / Pydantic model (unchanged)
+    # ---------------------------------------------------------
+    return Agent2EvaluatedPortfolio.model_validate_json(
+        res.choices[0].message.content
+    )
+
+def run_agent2_portfolio_manager(
+    p: CustomerProfile,
+    a1: Agent1Output,
+    qout: QuantEngineOutput,
+) -> Agent2EvaluatedPortfolio:
+    """
+    Thin wrapper for Agent 2 (Portfolio Manager) so the UI can call
+    a single function.
+    """
+    return agent2_portfolio_manager_gpt(p, a1, qout)
+
+# ============================================================================
+# 7 — Agent 3 (GPT) — narrative report
+# ============================================================================
+
+
+def agent3_gpt(
+    profile: CustomerProfile,
+    a1: Agent1Output,
+    qout: QuantEngineOutput,
+    evaluated_portfolio: Agent2EvaluatedPortfolio,
+    cfa_ethical_guidelines_str: str,
+) -> Agent3Output:
+    client = OpenAI()
+
+    eval_json = evaluated_portfolio.model_dump_json(indent=2)
 
     # --- PROMPT ---
     user_prompt = f"""
-You are Agent 2, a CFA charterholder and institutional portfolio consultant.
+You are Agent 3, a CFA charterholder and institutional portfolio consultant.
+
+You receive:
+- The full institutional client profile.
+- The list of tickers and reasoning from Agent 1.
+- The quantitative metrics (expected return, volatility).
+- A structured portfolio evaluation from Agent 2 (Portfolio Manager).
 
 Your tasks:
 
@@ -542,21 +874,23 @@ Your tasks:
    - Investment horizon
    - Return expectations
    - Constraints (ethical, religious, liquidity)
-   - Incorporate Agent 1's reasoning as needed.
+   - Incorporate Agent 1's reasoning AND Agent 2's evaluation as needed.
 
 2. **Ethical / ESG / Religious**
    Compare the recommendation to CFA Institute ethical guidelines.
-   Include ESG factors and any religious / Shariah considerations.
+   Include ESG factors and any religious / Shariah considerations,
+   referencing the ESG alignment and concentration flags from Agent 2.
 
 3. **Shariah Compliance Statement**
    - If the client requires Shariah constraints, explicitly confirm or deny compliance.
    - If Shariah is not required, explicitly state that this is not applicable.
 
 4. **Risk Assessment**
-   Use the provided quantitative metrics:
+   Use the provided quantitative metrics and Agent 2's risk scores:
    - Expected annual return: {qout.expected_annual_return:.4f}
    - Annual volatility: {qout.annual_volatility:.4f}
-   Discuss volatility, concentration, and drawdown considerations.
+   - Agent 2 risk_score and overall_score
+   Discuss volatility, concentration, and drawdown considerations in plain language.
 
 5. **Limitations**
    Explain model limitations: historical data, optimization assumptions, mock data, simplifications.
@@ -574,13 +908,16 @@ Expected annual return: {qout.expected_annual_return:.4f}
 Annual volatility:       {qout.annual_volatility:.4f}
 Optimization details:    {qout.optimization_details}
 
+### Agent 2 Evaluated Portfolio (JSON):
+{eval_json}
+
 ### CFA Ethical Guidelines:
 {cfa_ethical_guidelines_str}
 
 ---
 
 ### OUTPUT REQUIREMENT (VERY IMPORTANT):
-Respond with **ONLY** a JSON object with EXACTLY this schema:
+Respond with ONLY a JSON object with EXACTLY this schema:
 
 {{
   "suitability_explanation": "text",
@@ -598,14 +935,121 @@ Respond with **ONLY** a JSON object with EXACTLY this schema:
         messages=[
             {
                 "role": "system",
-                "content":
-                "You are a CFA charterholder advisor. Follow CFA ethics and produce strictly JSON outputs."
+                "content": (
+                    "You are a CFA charterholder advisor. "
+                    "Follow CFA ethics and produce strictly JSON outputs."
+                ),
             },
-            {"role": "user", "content": user_prompt}
+            {"role": "user", "content": user_prompt},
         ],
     )
 
-    return Agent2Output.model_validate_json(res.choices[0].message.content)
+    return Agent3Output.model_validate_json(res.choices[0].message.content)
+# ============================================================================
+# 7 — Agent 3 (GPT) — narrative report
+# ============================================================================
+
+
+def agent3_gpt(
+    profile: CustomerProfile,
+    a1: Agent1Output,
+    qout: QuantEngineOutput,
+    evaluated_portfolio: Agent2EvaluatedPortfolio,
+    cfa_ethical_guidelines_str: str,
+) -> Agent3Output:
+    client = OpenAI()
+
+    eval_json = evaluated_portfolio.model_dump_json(indent=2)
+
+    # --- PROMPT ---
+    user_prompt = f"""
+You are Agent 3, a CFA charterholder and institutional portfolio consultant.
+
+You receive:
+- The full institutional client profile.
+- The list of tickers and reasoning from Agent 1.
+- The quantitative metrics (expected return, volatility).
+- A structured portfolio evaluation from Agent 2 (Portfolio Manager).
+
+Your tasks:
+
+1. **Suitability**
+   Explain how the recommended portfolio aligns with the client’s full questionnaire, including:
+   - Risk tolerance
+   - Investment horizon
+   - Return expectations
+   - Constraints (ethical, religious, liquidity)
+   - Incorporate Agent 1's reasoning AND Agent 2's evaluation as needed.
+
+2. **Ethical / ESG / Religious**
+   Compare the recommendation to CFA Institute ethical guidelines.
+   Include ESG factors and any religious / Shariah considerations,
+   referencing the ESG alignment and concentration flags from Agent 2.
+
+3. **Shariah Compliance Statement**
+   - If the client requires Shariah constraints, explicitly confirm or deny compliance.
+   - If Shariah is not required, explicitly state that this is not applicable.
+
+4. **Risk Assessment**
+   Use the provided quantitative metrics and Agent 2's risk scores:
+   - Expected annual return: {qout.expected_annual_return:.4f}
+   - Annual volatility: {qout.annual_volatility:.4f}
+   - Agent 2 risk_score and overall_score
+   Discuss volatility, concentration, and drawdown considerations in plain language.
+
+5. **Limitations**
+   Explain model limitations: historical data, optimization assumptions, mock data, simplifications.
+
+---
+
+### Customer Profile (JSON):
+{profile.model_dump_json(indent=2)}
+
+### Agent 1 Selected Tickers:
+{a1.selected_stock_tickers}
+
+### Quant Engine Output:
+Expected annual return: {qout.expected_annual_return:.4f}
+Annual volatility:       {qout.annual_volatility:.4f}
+Optimization details:    {qout.optimization_details}
+
+### Agent 2 Evaluated Portfolio (JSON):
+{eval_json}
+
+### CFA Ethical Guidelines:
+{cfa_ethical_guidelines_str}
+
+---
+
+### OUTPUT REQUIREMENT (VERY IMPORTANT):
+Respond with ONLY a JSON object with EXACTLY this schema:
+
+{{
+  "suitability_explanation": "text",
+  "ethical_considerations": "text",
+  "shariah_compliance_statement": "text",
+  "risk_assessment": "text",
+  "limitations": "text"
+}}
+"""
+
+    # --- COMPLETION CALL ---
+    res = client.chat.completions.create(
+        model="gpt-4o-mini",
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a CFA charterholder advisor. "
+                    "Follow CFA ethics and produce strictly JSON outputs."
+                ),
+            },
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+
+    return Agent3Output.model_validate_json(res.choices[0].message.content)
 
 
 
@@ -624,9 +1068,14 @@ def run_quant_engine(tickers: Tuple[str, ...]) -> QuantEngineOutput:
     return quant_engine(list(tickers))
 
 
-def run_agent2_report(p: CustomerProfile, a1: Agent1Output, qout: QuantEngineOutput) -> Agent2Output:
+def run_agent3_report(
+    p: CustomerProfile,
+    a1: Agent1Output,
+    qout: QuantEngineOutput,
+    evaluated_portfolio: Agent2EvaluatedPortfolio,
+) -> Agent3Output:
     try:
-        with open('cfa_standards_full.json', 'r') as f:
+        with open("cfa_standards_full.json", "r") as f:
             cfa_data = json.load(f)
 
         cfa_principles = cfa_data.get("cfa_principles", [])
@@ -636,7 +1085,8 @@ def run_agent2_report(p: CustomerProfile, a1: Agent1Output, qout: QuantEngineOut
         cfa_ethical_guidelines_str = (
             f"CFA standards unavailable ({e}). Ethical considerations will be limited."
         )
-    return agent2_gpt(p, a1, qout, cfa_ethical_guidelines_str)
+
+    return agent3_gpt(p, a1, qout, evaluated_portfolio, cfa_ethical_guidelines_str)
 
 
 @st.cache_resource
@@ -689,16 +1139,16 @@ def safe_index(options_list, value):
 # ============================================================================
 
 
-def client_profile_page(sp500: pd.DataFrame):
+def client_profile_page():
     # Preload data in the background while user fills the form
     _ = preload_data()
     sample_profile = {
-        "full_name": "Future Homeless Millionaire",
+        "full_name": "Warren Buff-It",
         "email": "millionaire@abc.com",
 
         # Return objectives
         "primary_goal": "Long-term growth",
-        "target_annual_return": 8.5,
+        "target_annual_return": 6.5,
         "tradeoff_loss_vs_return": 7,
         "tolerance_underperformance": 6,
 
@@ -718,15 +1168,15 @@ def client_profile_page(sp500: pd.DataFrame):
         "tax_jurisdictions_to_avoid": "PFICs",
 
         # ESG
-        "esg_exclusions": ["Weapons", "Fossil fuels"],
+        "esg_exclusions":[],
         "esg_flags": ["Fully Shariah-compliant"],
         "esg_importance": 5,
         "esg_return_tradeoff": 5,
 
         # Diversification & allocation
         "allocation_equities_pct": 70.0,
-        "allocation_fixed_income_pct": 20.0,
-        "allocation_alternatives_pct": 10.0,
+        "allocation_fixed_income_pct": 30.0,
+        "allocation_alternatives_pct": 0.0,
         "concentration_tolerance": "Moderate",
         "max_single_issuer_exposure_pct": 12.0,
         "management_style": "Hybrid",
@@ -1252,199 +1702,89 @@ def client_profile_page(sp500: pd.DataFrame):
         # Clear any previous downstream computations
         if "a1" in st.session_state:
             del st.session_state["a1"]
+        if "evaluated_portfolio" in st.session_state:
+            del st.session_state["evaluated_portfolio"]
         if "report" in st.session_state:
             del st.session_state["report"]
 
         # IMPORTANT CHANGE:
         # Do NOT run Agent 1 here.
         # Just redirect to the Portfolio Recommendation page.
-        st.session_state["current_page"] = "Portfolio Recommendation"
+        st.session_state.redirect_to = "Portfolio Recommendation"
         st.rerun()
 
 
 # ============================================================================
 # 10 — Portfolio Recommendation Page
 # ============================================================================
+@st.cache_data
+def cached_allocation(dfw, sp500):
+    # Build allocation table and pie chart data
+    top_n = min(10, len(dfw))
+    top = dfw.head(top_n).copy()
+    others_weight = dfw["Weight"].iloc[top_n:].sum()
+    
+    if others_weight > 0:
+        top = pd.concat(
+            [top, pd.DataFrame([{"Ticker": "Others", "Weight": others_weight}])],
+            ignore_index=True,
+        )
 
+    # Name merge
+    name_map = None
+    if {"ticker", "name"}.issubset(sp500.columns):
+        name_map = sp500[["ticker", "name"]].rename(
+            columns={"ticker": "Ticker", "name": "Name"}
+        )
 
-def portfolio_page(sp500: pd.DataFrame):
-    st.title("Portfolio Recommendation")
+    df_table = dfw.copy()
+    if name_map is not None:
+        df_table = df_table.merge(name_map, on="Ticker", how="left")
+    else:
+        df_table["Name"] = ""
 
-    # Need a profile first
-    if "profile" not in st.session_state:
-        st.info("Please complete the Client Profile questionnaire first.")
-        return
-
-    profile: CustomerProfile = st.session_state["profile"]
-
-    # IMPORTANT CHANGE:
-    # Agent 1 MUST run only on this page (not on the Client Profile page).
-    if "a1" not in st.session_state:
-        time.sleep(1)
-        with st.spinner("Running Agent 1 (stock selection)…"):
-            st.session_state["a1"] = agent1_gpt4o(profile, sp500)
-
-    a1: Agent1Output = st.session_state["a1"]
-
-    # ----------------------------------------------------------------------
-    # 1) Agent 1 output (tickers + reasoning) — MUST BE FIRST
-    # ----------------------------------------------------------------------
-    st.markdown(
-        '<div class="section-header">Agent 1 — Stock Selection</div>',
-        unsafe_allow_html=True,
+    df_table = df_table[["Ticker", "Name", "Weight"]].sort_values(
+        "Weight", ascending=False
     )
+    df_table["Weight"] = df_table["Weight"].map(lambda x: f"{x:.0%}")
 
-    tickers_str = (
-        ", ".join(a1.selected_stock_tickers)
-        if a1.selected_stock_tickers
-        else "No tickers returned."
-    )
-    st.markdown(
-        f"<div class='chat-bubble'><b>Selected Tickers:</b> {tickers_str}</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        f"<div class='chat-bubble'>{a1.reasoning}</div>",
-        unsafe_allow_html=True,
-    )
+    return top, df_table
 
-    # ----------------------------------------------------------------------
-    # Optional Client Summary (still near the top, but after Agent 1)
-    # ----------------------------------------------------------------------
-    st.markdown(
-        '<div class="section-header">Client Summary</div>', unsafe_allow_html=True
-    )
-    st.markdown(
-        f"""
-<div class="client-card">
-<b>Name:</b> {profile.full_name}<br>
-<b>Primary goal:</b> {profile.primary_goal}<br>
-<b>Target return:</b> {profile.target_annual_return:.1f}%<br>
-<b>Horizon:</b> {profile.investment_horizon}<br>
-<b>Liquidity need:</b> {profile.desired_liquid_portion_pct}% liquid<br>
-<b>Risk tolerance (derived):</b> {profile.risk_tolerance.title()}<br>
-<b>Management style:</b> {profile.management_style}<br>
-<b>Benchmark preference:</b> {profile.preferred_benchmark}<br>
-<b>Reporting:</b> {profile.reporting_frequency}
-</div>
-""",
-        unsafe_allow_html=True,
-    )
 
-    # ----------------------------------------------------------------------
-    # Run Quant Engine
-    # ----------------------------------------------------------------------
-    ticktuple = tuple(a1.selected_stock_tickers)
-    if not ticktuple:
-        st.warning("Agent 1 did not return any tickers to optimize.")
-        return
+@st.cache_data
+def cached_backtest(weights):
 
-    with st.spinner("Running Quant Engine…"):
-        qout = run_quant_engine(ticktuple)
+    # --------------------------------------------------
+    # 1) Download portfolio tickers using your cached tool
+    # --------------------------------------------------
+    tickers = list(weights.keys())
+    price_data = download_prices(tickers)
 
-    # ----------------------------------------------------------------------
-    # 2) KPI cards (expected return, volatility)
-    # ----------------------------------------------------------------------
-    st.markdown(
-        '<div class="section-header">Expected Return & Volatility</div>',
-        unsafe_allow_html=True,
-    )
-    c1, c2 = st.columns(2)
-    c1.markdown(
-        f"<div class='kpi-card'>"
-        f"<div class='kpi-label'>Expected Annual Return</div>"
-        f"<div class='kpi-value'>{qout.expected_annual_return:.2%}</div>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-    c2.markdown(
-        f"<div class='kpi-card'>"
-        f"<div class='kpi-label'>Annual Volatility</div>"
-        f"<div class='kpi-value'>{qout.annual_volatility:.2%}</div>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
+    # --------------------------------------------------
+    # 2) Integrated S&P500 cached downloader
+    # --------------------------------------------------
+    cache_dir = "cache_fast"
+    os.makedirs(cache_dir, exist_ok=True)
 
-    # ----------------------------------------------------------------------
-    # 3) Enhanced allocation pie chart (Top 10 + Others) & 4) Allocation table
-    # ----------------------------------------------------------------------
-    st.markdown(
-        '<div class="section-header">Allocation</div>', unsafe_allow_html=True
-    )
-    with st.spinner("Generating allocation charts…"):
-        time.sleep(2)
-        if qout.portfolio_weights:
-            dfw = pd.DataFrame(
-                {
-                    "Ticker": list(qout.portfolio_weights.keys()),
-                    "Weight": list(qout.portfolio_weights.values()),
-                }
-            ).sort_values("Weight", ascending=False)
+    today = datetime.now()
+    max_age = timedelta(days=56)  # 8 weeks
+    sp500_path = os.path.join(cache_dir, "gspc.parquet")
 
-            # Top 10 + Others
-            top_n = min(10, len(dfw))
-            top = dfw.head(top_n).copy()
-            others_weight = dfw["Weight"].iloc[top_n:].sum()
-            if others_weight > 0:
-                top = pd.concat(
-                    [top, pd.DataFrame([{"Ticker": "Others", "Weight": others_weight}])],
-                    ignore_index=True,
-                )
+    sp500_data = None
 
-            # Two-column layout (Pie + Table)
-            col_pie, col_table = st.columns([2, 1])
+    # Try loading from cache
+    if os.path.exists(sp500_path):
+        mtime = datetime.fromtimestamp(os.path.getmtime(sp500_path))
+        if today - mtime <= max_age:
+            try:
+                sp500_data = pd.read_parquet(sp500_path)
+            except Exception:
+                sp500_data = None
 
-            with col_pie:
-                fig_pie = px.pie(
-                    top,
-                    names="Ticker",
-                    values="Weight",
-                    hole=0.4,
-                )
-                fig_pie.update_traces(
-                    textinfo="label+percent",
-                    hovertemplate="%{label}<br>Weight=%{value:.0%}<extra></extra>",
-                )
-                fig_pie.update_layout(
-                    margin=dict(l=0, r=0, t=20, b=0),
-                    showlegend=False,
-                )
-                st.plotly_chart(fig_pie, width="stretch")
-
-            with col_table:
-                name_map = None
-                if {"ticker", "name"}.issubset(sp500.columns):
-                    name_map = sp500[["ticker", "name"]].rename(
-                        columns={"ticker": "Ticker", "name": "Name"}
-                    )
-                df_table = dfw.copy()
-                if name_map is not None:
-                    df_table = df_table.merge(name_map, on="Ticker", how="left")
-                else:
-                    df_table["Name"] = ""
-
-                df_table = df_table[["Ticker", "Name", "Weight"]].sort_values(
-                    "Weight", ascending=False
-                )
-                df_table["Weight"] = df_table["Weight"].map(lambda x: f"{x:.0%}")
-                st.markdown("**Full Allocation**")
-                st.dataframe(df_table, width="stretch", height=400)
-        else:
-            st.warning("No portfolio weights available.")
-
-    # ----------------------------------------------------------------------
-    # 5) 5-year backtest vs S&P 500 chart (percentage axis)
-    # ----------------------------------------------------------------------
-    st.markdown(
-        '<div class="section-header">Portfolio Backtest — 5-Year Performance vs S&P 500</div>',
-        unsafe_allow_html=True,
-    )
-    with st.spinner("Running 5-year backtest…"):
-        time.sleep(1)
+    # Download new copy if needed
+    if sp500_data is None:
         try:
-            price_data = download_prices(list(qout.portfolio_weights.keys()))
-
-            sp500_data = yf.download(
+            d = yf.download(
                 "^GSPC",
                 period="5y",
                 interval="1mo",
@@ -1452,156 +1792,362 @@ def portfolio_page(sp500: pd.DataFrame):
                 auto_adjust=False,
                 multi_level_index=False,
             )
+            if not d.empty:
+                d = d[["Adj Close"]].rename(columns={"Adj Close": "^GSPC"})
+                d.to_parquet(sp500_path)
+                sp500_data = d
+        except Exception:
+            return None
 
-            if (
-                not price_data.empty
-                and len(price_data.columns) >= 2
-                and not sp500_data.empty
-            ):
-                # Normalize portfolio to 1.0 at start
-                norm_prices = price_data / price_data.iloc[0]
-                weights_series = pd.Series(qout.portfolio_weights)
-                weights_series = weights_series.reindex(norm_prices.columns).fillna(0.0)
-                portfolio_value = (norm_prices * weights_series).sum(axis=1)
+    # --------------------------------------------------
+    # 3) Validate price data
+    # --------------------------------------------------
+    if (
+        price_data.empty
+        or price_data.shape[1] == 0
+        or sp500_data is None
+        or sp500_data.empty
+    ):
+        return None
 
-                # S&P 500 normalized
-                sp500_series = sp500_data["Adj Close"]
-                sp500_series = sp500_series.reindex(portfolio_value.index, method="ffill")
-                sp500_norm = sp500_series / sp500_series.iloc[0]
+    # --------------------------------------------------
+    # 4) Normalize portfolio
+    # --------------------------------------------------
+    norm_prices = price_data / price_data.iloc[0]
 
-                # Convert to % change (start = 0%)
-                portfolio_pct = (portfolio_value - 1.0) * 100.0
-                sp500_pct = (sp500_norm - 1.0) * 100.0
+    weights_series = pd.Series(weights)
+    weights_series = weights_series.reindex(norm_prices.columns).fillna(0.0)
 
-                backtest_df = pd.DataFrame(
-                    {
-                        "Portfolio": portfolio_pct,
-                        "S&P 500": sp500_pct,
-                    }
-                )
+    portfolio_value = (norm_prices * weights_series).sum(axis=1)
 
-                fig_backtest = px.line(
-                    backtest_df,
-                    labels={"index": "Date", "value": "Return (%)", "variable": ""},
-                    title="Backtested Portfolio Performance vs S&P 500 (5 Years)",
-                )
-                fig_backtest.update_layout(
-                    hovermode="x unified",
-                    legend=dict(
-                        orientation="h",
-                        yanchor="bottom",
-                        y=1.02,
-                        xanchor="right",
-                        x=1,
-                    ),
-                )
-                st.plotly_chart(fig_backtest, width="stretch")
-            else:
-                st.warning("Insufficient data to run the backtest.")
-        except Exception as e:
-            st.warning(f"Could not compute backtest: {e}")
+    # --------------------------------------------------
+    # 5) Normalize S&P 500
+    # --------------------------------------------------
+    sp500_series = sp500_data["^GSPC"]
+    sp500_series = sp500_series.reindex(portfolio_value.index, method="ffill")
+    sp500_norm = sp500_series / sp500_series.iloc[0]
 
-    # ----------------------------------------------------------------------
-    # 6) Industry sector treemap
-    # ----------------------------------------------------------------------
-    with st.spinner("Building sector allocation treemap…"):
-        time.sleep(1)
-        ticker_to_sector = sp500.set_index('ticker')['sector'].to_dict() # Assuming 'sp500' has 'ticker' and 'Sector' columns
+    # --------------------------------------------------
+    # 6) Convert to % returns
+    # --------------------------------------------------
+    portfolio_pct = (portfolio_value - 1.0) * 100.0
+    sp500_pct = (sp500_norm - 1.0) * 100.0
 
-        ind = []
-        for t, w in qout.portfolio_weights.items():
-            sector = ticker_to_sector.get(t, "Unknown") # Get sector, default to "Unknown" if not found
-            ind.append({"sector": sector, "Weight": w})
+    return pd.DataFrame({
+        "Portfolio": portfolio_pct,
+        "S&P 500": sp500_pct
+    })
+
+
+@st.cache_data
+def cached_sector_treemap(weights, sp500):
+    ticker_to_sector = sp500.set_index('ticker')['sector'].to_dict()
+
+    ind = []
+    for t, w in weights.items():
+        sector = ticker_to_sector.get(t, "Unknown")
+        ind.append({"sector": sector, "Weight": w})
+
+    ind_df = pd.DataFrame(ind).groupby("sector", as_index=False)["Weight"].sum()
+    ind_df = ind_df.sort_values(by="Weight", ascending=False)
+
+    return ind_df
+
+def portfolio_page(sp500: pd.DataFrame):
+
+    st.title("Portfolio Recommendation")
+
+    if "profile" not in st.session_state:
+        st.info("Please complete the Client Profile questionnaire first.")
+        return
+
+    profile = st.session_state["profile"]
+
+    # Only run once
+    if "a1" not in st.session_state:
+        with st.spinner("Agent 1: Selecting Stocks and Reasoning…"):
+            st.session_state["a1"] = agent1_gpt4o(profile, sp500)
+
+    a1 = st.session_state["a1"]
+    qout = a1.quant_output
+
+    if qout is None:
+        st.error("Agent 1 did not return quant results.")
+        return
+
+    # ================================================================
+    # Agent 1 Output
+    # ================================================================
+    st.markdown('<div class="section-header">Agent 1 — Stocks Investment Analyst</div>', unsafe_allow_html=True)
+    tickers_str = ", ".join(a1.selected_stock_tickers) or "No tickers returned."
+    st.markdown(f"<div class='chat-bubble'><b>Selected Tickers:</b> {tickers_str}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='chat-bubble'>{a1.reasoning}</div>", unsafe_allow_html=True)
+
+    # Client Summary
+    st.markdown('<div class="section-header">Client Summary</div>', unsafe_allow_html=True)
+    st.markdown(
+        f"""
+<div class="client-card">
+<b>Name:</b> {profile.full_name}<br>
+<b>Primary goal:</b> {profile.primary_goal}<br>
+<b>Target return:</b> {profile.target_annual_return:.1f}%<br>
+<b>Horizon:</b> {profile.investment_horizon}<br>
+<b>Liquidity:</b> {profile.desired_liquid_portion_pct}%<br>
+<b>Risk tolerance:</b> {profile.risk_tolerance.title()}<br>
+<b>Benchmark:</b> {profile.preferred_benchmark}<br>
+<b>Reporting:</b> {profile.reporting_frequency}
+</div>
+""",
+        unsafe_allow_html=True
+    )
+
+    # ================================================================
+    # 2) KPI Cards
+    # ================================================================
+    st.markdown('<div class="section-header">Expected Return & Volatility</div>', unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+    c1.markdown(
+        f"<div class='kpi-card'><div class='kpi-label'>Expected Annual Return</div>"
+        f"<div class='kpi-value'>{qout.expected_annual_return:.2%}</div></div>",
+        unsafe_allow_html=True,
+    )
+    c2.markdown(
+        f"<div class='kpi-card'><div class='kpi-label'>Volatility</div>"
+        f"<div class='kpi-value'>{qout.annual_volatility:.2%}</div></div>",
+        unsafe_allow_html=True,
+    )
+
+    # ================================================================
+    # 3) Allocation Chart (cached)
+    # ================================================================
+    st.markdown('<div class="section-header">Top Allocation Chart</div>', unsafe_allow_html=True)
+
+    dfw = pd.DataFrame({"Ticker": list(qout.portfolio_weights.keys()),
+                        "Weight": list(qout.portfolio_weights.values())})
+
+    dfw = dfw.sort_values("Weight", ascending=False)
+
+    top, df_table = cached_allocation(dfw, sp500)
+
+    col_pie, col_table = st.columns([2, 1])
+
+    with col_pie:
+        fig_pie = px.pie(top, names="Ticker", values="Weight", hole=0.3)
+        fig_pie.update_traces(textinfo="label+percent",hovertemplate="%{label}<br>Weight=%{value:.0%}<extra></extra>",textfont_size=15,textfont=dict(weight='bold'))
+        fig_pie.update_layout(margin=dict(l=0, r=0, t=0, b=0), showlegend=False)
+        st.plotly_chart(fig_pie, width="stretch")
+
+    html_table = df_table.to_html(classes="big-table")
+    st.markdown("""
+        <style>
+            .big-table {
+                font-size: 17px;
+            }
+        </style>
+    """, unsafe_allow_html=True)
+
+    with col_table:
+        st.markdown("**Full Allocation**")
+        st.markdown(html_table, unsafe_allow_html=True)
+
+    # ================================================================
+    # 4) Backtest (cached)
+    # ================================================================
+    st.markdown('<div class="section-header">Backtested Portfolio Performance (5 Years)</div>', unsafe_allow_html=True)
+
+    backtest_df = cached_backtest(qout.portfolio_weights)
+
+    if backtest_df is None:
+        st.warning("Insufficient data to run the backtest.")
+    else:
+        fig_backtest = px.line(
+            backtest_df,
+            labels={
+                "index": "Date",
+                "value": "Return (%)",
+                "variable": ""
+            },
+        )
+
+        fig_backtest.update_layout(
+            hovermode="x unified",
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1,
+                font=dict(size=20)
+            ),
+            margin=dict(l=0, r=0, t=40, b=0),
+            font=dict(size=16)
+        )
+        fig_backtest.update_layout(
+            xaxis=dict(
+                title=dict(font=dict(size=16)),   # X-axis label
+                tickfont=dict(size=16)            # X-axis tick numbers
+            ),
+            yaxis=dict(
+                title=dict(font=dict(size=16)),   # Y-axis label
+                tickfont=dict(size=16)            # Y-axis tick numbers
+            ),
+            legend=dict(
+                font=dict(size=16)
+            )
+        )
+        fig_backtest.update_traces(mode="lines", line=dict(width=2))
+
+        st.plotly_chart(fig_backtest, width="stretch")
+
+    # ================================================================
+    # 5) Sector Treemap (cached)
+    # ================================================================
+    st.markdown('<div class="section-header">Sector Allocation</div>', unsafe_allow_html=True)
+
+    ind_df = cached_sector_treemap(qout.portfolio_weights, sp500)
+    fig_tree = px.treemap(
+        ind_df,
+        path=[px.Constant("Portfolio"), "sector"],
+        values="Weight",
+        color="Weight",
+        color_continuous_scale="Blues",
+    )
+    fig_tree.update_traces(textinfo="label+percent parent", textfont_size=20,hovertemplate="Sector: %{label}<br>Weight: %{value:.1%}<extra></extra>")
+    fig_tree.update_layout(coloraxis_showscale=False)
+    st.plotly_chart(fig_tree, width="stretch")
+
+    # ================================================================
+    # Agents 2
+    # ================================================================
+    st.markdown( '<div class="section-header">Agent 2 — Portfolio Manager (Evaluation)</div>', unsafe_allow_html=True, )
+    if "evaluated_portfolio" not in st.session_state:
+        with st.spinner("Agent 2: Evaluating Portfolio…"):
+            st.session_state["evaluated_portfolio"] = run_agent2_portfolio_manager(
+                profile, a1, qout
+            )
+    eval_port = st.session_state["evaluated_portfolio"]
+
+    # KPI Scores
+    c1, c2, c3, c4 = st.columns(4)
+    c1.markdown(f"<div class='kpi-card'><div class='kpi-label'>Overall Suitability</div><div class='kpi-value'>{eval_port.overall_score:.1f}</div></div>", unsafe_allow_html=True)
+    c2.markdown(f"<div class='kpi-card'><div class='kpi-label'>Risk</div><div class='kpi-value'>{eval_port.risk_score:.1f}</div></div>", unsafe_allow_html=True)
+    c3.markdown(f"<div class='kpi-card'><div class='kpi-label'>Diversification</div><div class='kpi-value'>{eval_port.diversification_score:.1f}</div></div>", unsafe_allow_html=True)
+    c4.markdown(f"<div class='kpi-card'><div class='kpi-label'>Liquidity</div><div class='kpi-value'>{eval_port.liquidity_score:.1f}</div></div>", unsafe_allow_html=True)
+
+    st.markdown("<div style='height: 20px;'></div>", unsafe_allow_html=True)
+    chat_bubble(
+        "Suitability Bucket",
+        f"This portfolio is classified as: <b>{eval_port.suitability_bucket}</b>.",
+    )
+    chat_bubble("Risk & Return Profile", eval_port.risk_exposure_summary)
+    chat_bubble("Diversification", eval_port.diversification_summary)
+    chat_bubble("Liquidity & Horizon", eval_port.liquidity_and_horizon_summary)
+    approval = str(eval_port.approval).strip().lower()
+
+    mistakes_clean = [m.strip() for m in eval_port.mistakes if m.strip()]
+
+    if eval_port.concentration_flags:
+        flags_html = "<br>".join(f"• {f}" for f in eval_port.concentration_flags)
+        chat_bubble("Concentration Flags", flags_html)
+
+    if approval == "approved":
+        # Base HTML for an approved decision
+        html = "<span style='color: green; font-weight: bold;'>APPROVED</span>"
+
+        if not mistakes_clean:
+            # If the mistakes list is empty, it's a clean approval.
+            html += " — Clean approval. No material action items required."
+        else:
+            # If the mistakes list is NOT empty, it's an approval with conditions/actions.
+            # This replaces the old "conditionally approved" state.
+            html += " — APPROVED with action items. See required remediation below."
             
-        ind_df = pd.DataFrame(ind).groupby("sector", as_index=False)["Weight"].sum()
-        
-        # Sort the data for better visualization flow
-        ind_df = ind_df.sort_values(by='Weight', ascending=False)
-        
-        fig_tree = px.treemap(
-            ind_df, 
-            path=[px.Constant("Portfolio"), 'sector'],
-            values='Weight',
-            color='Weight',
-            color_continuous_scale='Blues', # Other good options: 'Jet', 'Rainbow', 'HSV', 'Turbo'
-        )
+            # Add the list of issues/conditions
+            html += "<br><br><b>⚠️ Required Remediation / Action Items:</b><br>" + "<br>".join(f"• {m}" for m in mistakes_clean)
+            
+        chat_bubble("Final Decision", html)
+    else:
+        html = """
+            <span style='color: red; font-weight: bold;'>NOT APPROVED</span>
+            — Conflicts detected with the client's ESG/Shariah criteria.
+        """
+        if mistakes_clean:
+            html += "<br><br><b>Violations:</b><br>" + "<br>".join(f"• {m}" for m in mistakes_clean)
 
-        # Customize the text and layout
-        fig_tree.update_traces(
-            textinfo="label+percent parent",
-            textfont_size=16, # Adjust this value as needed
-            textfont=dict(weight='bold'),
-            hovertemplate="Sector: %{label}<br>Weight: %{value:.1%}<extra></extra>"
-        )
-        
-        fig_tree.update_layout(
-            margin = dict(t=25, l=0, r=0, b=0),
-            title_text='Sector Allocation Treemap',
-            # Optional: You can also increase the overall font size for the title if needed
-            # title_font_size=24 
-        )
-
-        st.plotly_chart(fig_tree, width="stretch")
-
+        chat_bubble("Final Decision", html)
     # ----------------------------------------------------------------------
-    # 7) Agent 2 narrative report
+    # Agent 3 — Narrative Report
     # ----------------------------------------------------------------------
     st.markdown(
-        '<div class="section-header">Agent 2 — Narrative Report</div>',
+        '<div class="section-header">Agent 3 — CFA Ethical Consultant</div>',
         unsafe_allow_html=True,
     )
 
     if "report" not in st.session_state:
-        with st.spinner("Generating Agent 2 report…"):
-            st.session_state["report"] = run_agent2_report(profile, a1, qout)
+        with st.spinner("Agent 3: Generating report…"):
+            st.session_state["report"] = run_agent3_report(
+                profile, a1, qout, eval_port
+            )
 
-    rep: Agent2Output = st.session_state["report"]
+    rep: Agent3Output = st.session_state["report"]
 
     chat_bubble("Suitability", rep.suitability_explanation)
     chat_bubble("Ethical & ESG Considerations", rep.ethical_considerations)
     chat_bubble("Shariah Compliance", rep.shariah_compliance_statement)
     chat_bubble("Risk Assessment", rep.risk_assessment)
     chat_bubble("Limitations", rep.limitations)
+    # ================================================================
+    # 6) Feedback Buttons — NO RECOMPUTATION
+    # ================================================================
+    st.markdown("### Improve Model Decisions")
 
+    colA, colB = st.columns(2)
+
+    with colA:
+        if st.button("👍 This decision was correct"):
+            rag_add_example(profile, a1, qout, eval_port, True, notes="Correct decision.")
+            st.success("Saved! Agent 2 will use this example in the future.")
+
+    with colB:
+        if st.button("👎 This decision was wrong"):
+            reason = st.text_area("Why was this wrong?", key="rag_feedback")
+            rag_add_example(profile, a1, qout, eval_port, False, notes=reason)
+            st.warning("Saved as an incorrect example.")
 
 # ============================================================================
 # 11 — MAIN
 # ============================================================================
-
-
 def main():
     st.sidebar.title("Navigation")
 
-    # Ensure current_page has a default
-    if "current_page" not in st.session_state:
-        st.session_state["current_page"] = "Client Profile"
+    # Initialize state variables
+    if "nav_page" not in st.session_state:
+        st.session_state.nav_page = "Client Profile"
+    if "redirect_to" not in st.session_state:
+        st.session_state.redirect_to = None
 
-    page_options = ["Client Profile", "Portfolio Recommendation"]
+    # Handle redirect BEFORE radio is created
+    if st.session_state.redirect_to is not None:
+        st.session_state.nav_page = st.session_state.redirect_to
+        st.session_state.redirect_to = None
+        st.rerun()
 
-    # Determine which page should be highlighted based on current_page
-    current = st.session_state["current_page"]
-    if current not in page_options:
-        current = "Client Profile"
-
-    default_index = page_options.index(current)
-
-    # Sidebar widget WITHOUT a key so we never mutate a widget key on redirect
-    page = st.sidebar.radio(
-        "",
-        page_options,
-        index=default_index,
+    # Sidebar radio
+    st.sidebar.radio(
+        "Go to:",
+        ["Client Profile", "Portfolio Recommendation"],
+        key="nav_page"
     )
-
-    # Sync selected page into session_state
-    if page != st.session_state["current_page"]:
-        st.session_state["current_page"] = page
 
     sp500 = load_quant_engine()
 
-    if st.session_state["current_page"] == "Client Profile":
-        client_profile_page(sp500)
+    # Route to correct page
+    if st.session_state.nav_page == "Client Profile":
+        client_profile_page()
     else:
         portfolio_page(sp500)
+
 
 
 if __name__ == "__main__":
